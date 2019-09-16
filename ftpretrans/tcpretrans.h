@@ -1,0 +1,1 @@
+int ConnectRealSvr(const int slbfd, const char* svraddr);

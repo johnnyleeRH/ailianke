@@ -1,0 +1,35 @@
+#ifndef MD_DCE_TCPSERVER_HPP
+#define MD_DCE_TCPSERVER_HPP
+
+#include <stdint.h>
+#include <boost/thread.hpp>
+struct epoll_event;
+
+class TcpServer{
+public:
+    explicit TcpServer(uint16_t tcpPort, size_t epollSize);
+    virtual ~TcpServer();
+    virtual int Start();
+    virtual void Stop();
+    bool isRunning() {return m_running;}
+
+protected:
+    virtual void HandleSockErr(const int fd);
+
+private:
+    void IOStart();
+    void AcceptHandle();
+    virtual void RecvTcpData(int readfd);
+    int CreateAndBind();
+    int SetNonBlock(int sockfd);
+
+    uint16_t m_listenPort;
+    int m_epollfd;
+    int m_listenfd;
+    bool m_running;
+    size_t m_pollsize;
+    struct epoll_event *m_events;
+    boost::thread  m_iohandle;
+};
+
+#endif //MD_DCE_TCPSERVER_HPP
