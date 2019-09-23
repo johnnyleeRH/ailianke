@@ -1,0 +1,1333 @@
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include "sockcomm.h"
+
+//#define MAXEVENTS 4
+#define MAXLINE 4096
+
+static uint16_t listenport_ = -1;
+static int epollfd_ = -1;
+static int listenfd_ = -1;
+static int running_ = 1;
+static size_t epollsize_ = -1;
+static struct epoll_event* epollevent_ = 0;
+static pthread_t tid_ = -1;
+struct sockaddr_in servaddr;
+
+/*xu: release the connection to the real svr*/
+void Release() {
+  printf("release tcpsvr.");
+  if (-1 != epollfd_) close(epollfd_);
+  if (-1 != listenfd_) close(listenfd_);
+  for (int index = 0; index < epollsize_; ++index)
+    close(epollevent_[index].data.fd);
+  free(epollevent_);
+}
+
+static int CreateAndBind() {
+  listenfd_ = socket(AF_INET, SOCK_STREAM, 0);
+  if (-1 == listenfd_) {
+    printf("create server socket failed error %d.", errno);
+    return -1;
+  }
+  struct sockaddr_in serveraddr;
+  bzero(&serveraddr, sizeof(serveraddr));
+  serveraddr.sin_family = AF_INET;
+  serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  serveraddr.sin_port = htons(listenport_);
+  if (-1 ==
+      bind(listenfd_, (struct sockaddr*)&serveraddr, sizeof(serveraddr))) {
+    printf("server socket bind error %d.", errno);
+    return -1;
+  }
+  return 0;
+}
+
+/*xu: recv data retrans to the destination server*/
+static void RecvTcpData(int readfd) {
+  printf(" recv tcp data.\n");
+  static char buf[MAXLINE];
+  while (running_) {
+    ssize_t count;
+    count = read(readfd, buf, sizeof(buf));
+    printf("recv cont is %d.\n", count);
+    if (-1 == count) {
+      if (errno != EAGAIN) {
+        // EAGAIN means all data been read, go back.
+        printf("read failed %d.", errno);
+      }
+      break;
+    } else if (count == 0) {
+      /*graceful socket close*/
+      printf("recv cont is 0.\n");
+      break;
+    } else {
+      // handle the user data
+    }
+  }
+}
+
+/*xu: new socket recv, shall connect to the destination server*/
+static void AcceptHandle() {
+  struct sockaddr in_addr;
+  socklen_t in_len = sizeof(in_addr);
+
+  while (running_) {
+    int infd = accept(listenfd_, &in_addr, &in_len);
+    if (-1 == infd) {
+      if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+        return;
+      else {
+        printf("accept failed.");
+        return;
+      }
+    }
+    if (-1 == SetNonBlock(infd)) return;
+    struct epoll_event event;
+    event.data.fd = infd;
+    event.events = EPOLLIN | EPOLLET;
+    if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, infd, &event)) {
+      printf("epoll control add error %d.", errno);
+      return;
+    }
+    printf("new socket %d accepted.", infd);
+  }
+}
+
+/*xu: release the connection to the real svr*/
+static void HandleSockErr(const int fd) {
+  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
+    printf("epoll control delete socket [%d] error %d.", fd, errno);
+  else
+    printf("delete socket [%d] event success.", fd);
+  close(fd);
+}
+
+void Stop() {
+  running_ = 0;
+  pthread_join(&tid_, 0);
+}
+
+int IsRunning() { return running_; }
+
+static void* IOStart(void* param) {
+  struct epoll_event event;
+  event.data.fd = listenfd_;
+  event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, listenfd_, &event)) {
+    printf("epoll control listen error %d.", errno);
+    return;
+  }
+
+  if (-1 == listen(listenfd_, SOMAXCONN)) {
+    printf("server socket listen error %d.", errno);
+    return;
+  }
+
+  // set wait time 1 sec
+  const int kexpire = 1000;
+  while (running_) {
+    int readynum = epoll_wait(epollfd_, epollevent_, epollsize_, kexpire);
+    if (-1 == readynum) {
+      printf("epoll wait error %d.", errno);
+      continue;
+    } else if (0 == readynum) {
+      // timer expire
+      continue;
+    }
+    printf("ready num is %d.\n", readynum);
+    for (int index = 0; index < readynum; ++index) {
+      printf("fd %d ready， events %u.\n", epollevent_[index].data.fd, epollevent_[index].events);
+      if (epollevent_[index].events & EPOLLOUT) {
+        printf("fd %d epoll out.\n", epollevent_[index].data.fd);
+        int result;
+        socklen_t result_len = sizeof(result);
+        if (getsockopt(epollevent_[index].data.fd, SOL_SOCKET, SO_ERROR, &result, &result_len) < 0) {
+          printf("get sock opt failed.\n");
+          continue;
+        }
+
+        if (result != 0) {
+          // connection failed; error code is in 'result'
+          if (connect(epollevent_[index].data.fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+            printf("connect in iostart failed, errno %d\n", errno);
+          }
+          printf("connect result is not zero ~!! \n");	
+          continue;
+        }
+        struct sockaddr addr;
+        socklen_t len = sizeof(addr);
+        if (0 != getpeername(epollevent_[index].data.fd, &addr, &len)) {
+          printf("socket not connect %d.\n", errno);
+          if (connect(epollevent_[index].data.fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+            printf("connect in iostart failed, errno %d\n", errno);
+          }
+          continue;
+        }
+        printf("fd connect success.\n");
+      }
+      if ((epollevent_[index].events & EPOLLERR) ||
+          (epollevent_[index].events & EPOLLHUP) ||
+          (epollevent_[index].events & EPOLLRDHUP) ||
+          (!(epollevent_[index].events & EPOLLIN))) {
+        printf("epoll error happen, events %u.\n", epollevent_[index].events);
+        // HandleSockErr(epollevent_[index].data.fd);
+        continue;
+      }
+      printf("hahaha\n");
+      if (listenfd_ == epollevent_[index].data.fd) {
+        printf("listen index %d, fd %d.", index, listenfd_);
+        AcceptHandle();
+      } else {
+        RecvTcpData(epollevent_[index].data.fd);
+      }
+    }
+  }
+}
+
+int StartTcpSvr(uint16_t port, size_t pollsize) {
+  listenport_ = port;
+  epollsize_ = pollsize;
+  epollevent_ = (struct epoll_event*)malloc((epollsize_ + 1) *
+                                            sizeof(struct epoll_event));
+  if (0 == epollevent_) return -1;
+  if (-1 == CreateAndBind()) return -1;
+  if (-1 == SetNonBlock(listenfd_)) return -1;
+  if (-1 == (epollfd_ = epoll_create1(0))) {
+    printf("epoll create error %d.", errno);
+    return -1;
+  }
+  if (0 != pthread_create(&tid_, 0, IOStart, 0)) {
+    printf("create iostart failed!\n");
+    return -1;
+  }
+  return 0;
+}
+
+int ConnectRealSvr(const char* svraddr) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  printf("client fd is %d.\n", sockfd);
+  
+
+  if (sockfd == -1) {
+    printf("client socket creation failed\n");
+    return -1;
+  }
+
+  if (0 != SetNonBlock(sockfd))
+    return -1;
+
+  bzero(&servaddr, sizeof(servaddr));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr = inet_addr(svraddr);
+  servaddr.sin_port = htons(21);
+
+  // connect the client socket to server socket
+  if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+    if (errno != EINPROGRESS) {
+    printf("connection with the server %s failed %d.\n", svraddr, errno);
+    return -1;
+    }
+  } else {
+    printf("client connect to svr.\n");
+  }
+  struct epoll_event event;
+    event.data.fd = sockfd;
+    event.events = EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLOUT;
+    if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, sockfd, &event)) {
+      printf("epoll control add error %d.", errno);
+      return -1;
+    }
+  printf("client create success.\n");
+  
+  return 0;
+}
+
+
+int main() {
+  printf("1");
+  StartTcpSvr(225, 1000);
+  printf("2");
+  ConnectRealSvr("10.10.108.147");
+  while (1) {
+    sleep(1);
+  }
+}
+
+#if 0
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 8221.
+fd 5 epoll out.
+connect in iostart failed, errno 103
+connect result is not zero ~!! 
+ready num is 1.
+fd 5 ready， events 20.
+fd 5 epoll out.
+socket not connect 107.
+connect in iostart failed, errno 115
+ready num is 1.
+fd 5 ready， events 4.
+fd 5 epoll out.
+fd connect success.
+epoll error happen, events 4.
+
+#endif

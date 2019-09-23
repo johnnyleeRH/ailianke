@@ -1,13 +1,16 @@
 # example demo
 CC = gcc
 CURRENT_PATH = $(shell pwd)
-INCLUDE = ${CURRENT_PATH}/
+INCLUDE = -I${CURRENT_PATH}/ \
+					-I${CURRENT_PATH}/common/
 # LIBPATH = ${CURRENT_PATH}/lib
 LIBS = -lpthread
 
+SRC = *.c common/*.c
+
 all: demo
-demo: *.c
-	${CC} $^ -I${INCLUDE} ${LIBS} -o $@
+demo: $(SRC)
+	${CC} $^ ${INCLUDE} ${LIBS} -o $@
 clean:
 	-rm -f *.o demo
 # all:$(subst .c,.o,$(wildcard *.c))

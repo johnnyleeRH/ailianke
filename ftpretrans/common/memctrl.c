@@ -23,13 +23,13 @@ static int itemsize = 0;
 static pthread_mutex_t mutex;
 
 static void BucketNodeInit(BUCKET_NODE* node) {
-  node->val_ = NULL;
-  node->next_ = NULL;
+  node->val_ = 0;
+  node->next_ = 0;
 }
 
 static void IndexNodeInit(INDEX_NODE* node) {
-  node->val_ = NULL;
-  node->next_ = NULL;
+  node->val_ = 0;
+  node->next_ = 0;
   node->itemused = 0;
 }
 
@@ -112,20 +112,20 @@ int MemInit(int size) {
   if (0 == bucketnode.val_) {
     printf("create bucket mem failed.\n");
     free(indexnode.val_);
-    indexnode.val_ = NULL;
+    indexnode.val_ = 0;
     return -1;
   }
   // spare index set to 1
   memset(indexnode.val_, 0xFF, BYTE_PER_NUM);
-  pthread_mutex_init(&mutex, NULL);
+  pthread_mutex_init(&mutex, 0);
   return 0;
 }
 
 void MemDestroy() {
-  pthread_mutex_destory(&mutex);
+  pthread_mutex_destroy(&mutex);
   INDEX_NODE* p = indexnode.next_;
   INDEX_NODE* tmp = p;
-  while (NULL != p) {
+  while (0 != p) {
     tmp = p;
     free(p->val_);
     p = p->next_;
@@ -134,7 +134,7 @@ void MemDestroy() {
   if (indexnode.val_) free(indexnode.val_);
   BUCKET_NODE* bp = bucketnode.next_;
   BUCKET_NODE* btmp = p;
-  while (NULL != bp) {
+  while (0 != bp) {
     btmp = bp;
     free(bp->val_);
     bp = bp->next_;
@@ -149,29 +149,29 @@ char* GetItemMem() {
   INDEX_NODE* tmp = p;
   BUCKET_NODE* bp = &bucketnode;
   BUCKET_NODE* btmp = bp;
-  while (NULL != p) {
+  while (0 != p) {
     if (p->itemused < DEFAULT_ITEM_NUM) break;
     tmp = p;
     btmp = bp;
     bp = bp->next_;
     p = p->next_;
   }
-  if (NULL != p) {
+  if (0 != p) {
     int index = GetSpareLoc(p);
     if (0 == index) {
       printf("error happend, index not equal to cnt.\n");
       pthread_mutex_unlock(&mutex);
-      return NULL;
+      return 0;
     }
     pthread_mutex_unlock(&mutex);
     return bp->val_ + itemsize * (index - 1);
   }
-  INDEX_NODE* newinode = NULL;
-  BUCKET_NODE* newbnode = NULL;
+  INDEX_NODE* newinode = 0;
+  BUCKET_NODE* newbnode = 0;
   int ret = CreateNode(&newinode, &newbnode);
   if (0 != ret) {
     pthread_mutex_unlock(&mutex);
-    return NULL;
+    return 0;
   }
   tmp->next_ = newinode;
   btmp->next_ = newbnode;
@@ -183,7 +183,7 @@ char* GetItemMem() {
 void ResetItem(char* item) {
   INDEX_NODE* p = &indexnode;
   BUCKET_NODE* bp = &bucketnode;
-  while (NULL != bp) {
+  while (0 != bp) {
     if (item >= bp->val_ && item < bp->val_ + DEFAULT_ITEM_NUM * itemsize) {
       if ((item - bp->val_) % itemsize != 0) {
         printf("Reset addr error.\n");

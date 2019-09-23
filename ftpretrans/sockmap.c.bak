@@ -1,0 +1,163 @@
+#include <string.h>
+#include <netinet/in.h>
+
+//need change to hash map
+typedef struct _SlbSvrMap_ {
+  int slbfd_;
+  int clifd_;
+  struct _SlbSvrMap_* next_;
+} SlbSvrMap;
+
+static SlbSvrMap* maphead;
+
+typedef struct _CONN_BACKUP_ {
+  int slbfd_;
+  int clifd_;
+  struct sockaddr_in sockaddr_;
+  struct _CONN_BACKUP_* next_;
+} CONN_BACKUP;
+
+static CONN_BACKUP* backuphead;
+
+int Init() {
+  backuphead = 0;
+  maphead = 0;
+}
+
+static int AppendSockMap(SlbSvrMap* map) {
+  if (0 == maphead) {
+    maphead = map;
+    return 0;
+  }
+  CONN_BACKUP* tmp = maphead;
+  while (0 != tmp) {
+    if (tmp->clifd_ == map->clifd_ || tmp->slbfd_ == map->slbfd_) {
+      printf("error happen in sock map.\n");
+      free(map);
+      return -1;
+    }
+    if (0 == tmp->next_)
+      break;
+    else
+      tmp = tmp->next_;
+  }
+  tmp->next_ = map;
+  return 0;
+}
+
+static int AppendBackup(const CONN_BACKUP* back) {
+  if (0 == backuphead) {
+    backuphead = back;
+    return 0;
+  }
+  CONN_BACKUP* tmp = backuphead;
+  while (0 != tmp) {
+    if (tmp->clifd_ == back->clifd_ || tmp->slbfd_ == back->slbfd_) {
+      printf("error happen in backup sock connection.\n");
+      free(back);
+      return -1;
+    }
+    if (0 == tmp->next_)
+      break;
+    else
+      tmp = tmp->next_;
+  }
+  tmp->next_ = back;
+  return 0;
+}
+
+static int RefreshBackup(const int clifd) {
+  int slbfd = -1;
+  CONN_BACKUP* tmp = backuphead;
+  CONN_BACKUP* pre = backuphead;
+  while (0 != tmp) {
+    if (tmp->clifd_ == clifd) {
+      slbfd = tmp->slbfd_;
+      if (tmp == backuphead) {
+        backuphead = tmp->next_;
+      } else {
+        pre->next_ = tmp->next_;
+      }
+      free(tmp);
+      return slbfd;
+    }
+    pre = tmp;
+    tmp = tmp->next_;
+  }
+  return slbfd;
+}
+
+static int RefreshSockMap(const int clifd) {
+  int slbfd = -1;
+  CONN_BACKUP* tmp = maphead;
+  CONN_BACKUP* pre = maphead;
+  while (0 != tmp) {
+    if (tmp->clifd_ == clifd) {
+      slbfd = tmp->slbfd_;
+      if (tmp == maphead) {
+        maphead = tmp->next_;
+      } else {
+        pre->next_ = tmp->next_;
+      }
+      free(tmp);
+      return slbfd;
+    }
+    pre = tmp;
+    tmp = tmp->next_;
+  }
+  return slbfd;
+}
+
+int FindPeerInBack(int clifd, struct sockaddr_in* addr) {
+  CONN_BACKUP* tmp = backuphead;
+  while (tmp != 0) {
+    if (tmp->clifd_ == clifd) {
+      memcpy((char*)addr, (char*)&(tmp->sockaddr_), sizeof(struct sockaddr_in));
+      return 0;
+    }
+    tmp = tmp->next_;
+  }
+  return -1;
+}
+
+int ConnBegin(const int slbfd, const int clifd, const char* svraddr) {
+  CONN_BACKUP * tmp = (CONN_BACKUP*)malloc(sizeof(CONN_BACKUP));
+  if (0 == tmp) {
+    printf("CONN_BACKUP malloc failed.\n");
+    return -1;
+  }
+  tmp->slbfd_ = slbfd;
+  tmp->clifd_ = clifd;
+  bzero(&tmp->sockaddr_, sizeof(struct sockaddr_in));
+  tmp->sockaddr_.sin_family = AF_INET;
+  tmp->sockaddr_.sin_addr.s_addr = inet_addr(svraddr);
+  tmp->sockaddr_.sin_port = htons(21);
+  tmp->next_ = 0;
+  return AppendBackup(tmp);
+}
+
+int Connected(const int clifd) {
+  int slbfd = RefreshBackup(clifd);
+  if (-1 == slbfd) {
+    printf("error happen, no slbfd for client %d in backup.\n", clifd);
+    return -1;
+  }
+  SlbSvrMap *map = (SlbSvrMap*)malloc(sizeof(SlbSvrMap));
+  if (0 == map) {
+    printf("SlbSvrMap malloc failed.\n");
+    return -1;
+  }
+  map->clifd_ = clifd;
+  map->slbfd_ = slbfd;
+  map->next_ = 0;
+  return AppendSockMap(map);
+}
+
+void ReleaseByCli(int clifd) {
+  int slbfd = RefreshSockMap(clifd);
+  if (-1 == slbfd) {
+    printf("client fd %d has no pair slb.\n", clifd);
+    return;
+  }
+  close(slbfd);
+}
