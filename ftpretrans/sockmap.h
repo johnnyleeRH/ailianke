@@ -1,7 +1,7 @@
 #ifndef SOCK_MAP_H_
 #define SOCK_MAP_H_
-#include <sys/socket.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 typedef enum _SockType_ {
   SOCKDEFAULT = -1,
@@ -11,6 +11,14 @@ typedef enum _SockType_ {
   DATASVR = 3,
   DATACLI = 4,
 } SockType;
+
+typedef enum _DataMod_ {
+  DEFAULT = -1,
+  PASVTRIGGERED = 0,
+  PORTTRIGGERED = 1,
+  PASV = 2,
+  PORT = 3
+} DataMod;
 // int Connected(const int clifd);
 int ConnBegin(const int slbfd, const int clifd, const char* svraddr);
 // int FindPeerInBack(int clifd, struct sockaddr_in* addr);
@@ -19,4 +27,7 @@ int MapInit();
 int MapDestroy();
 int FindPairSock(int fd);
 SockType GetSockType(int fd);
-#endif // SOCK_MAP_H_
+int SetSockMod(int fd, SockType type, DataMod mod);
+DataMod GetSockMod(int fd, SockType type);
+
+#endif  // SOCK_MAP_H_

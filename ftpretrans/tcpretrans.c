@@ -1,9 +1,9 @@
+#include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
-#include <errno.h>
 #include "sockcomm.h"
 #include "sockmap.h"
 
@@ -80,7 +80,8 @@ int ConnectRealSvr(const int slbfd, const char* svraddr) {
   servaddr.sin_port = htons(21);
   ConnBegin(slbfd, sockfd, svraddr);
   // connect the client socket to server socket
-  if (connect(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+  if (connect(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) <
+      0) {
     if (errno != EINPROGRESS) {
       printf("connection with the server %s failed\n", svraddr);
       return -1;
@@ -89,6 +90,7 @@ int ConnectRealSvr(const int slbfd, const char* svraddr) {
   return 0;
 }
 
+// 需要关闭对应的pair套接字
 static void HandleSockErr(const int fd) {
   if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
     printf("epoll control delete socket [%d] error %d.", fd, errno);
@@ -100,6 +102,18 @@ static void HandleSockErr(const int fd) {
 
 // 等待与真实服务端建立连接后，再侦听客户端的数据
 static int SessionConnected(int fd) {
+  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
+    printf("epoll control delete socket [%d] error %d.", fd, errno);
+  else {
+    //remove EPOLLOUT
+    struct epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+    if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &event)) {
+      printf("epoll connect event add %d.", errno);
+      return -1;
+    }
+  }
   int pair = FindPairSock(fd);
   if (-1 != pair) {
     struct epoll_event event;
@@ -135,24 +149,43 @@ static void AcceptHandle() {
   }
 }
 
-static void RecvTcpData(int readfd) {
+static void RecvTcpData(int readfd, SockType type) {
   static char buf[MAXLINE];
   int pair = FindPairSock(readfd);
   while (running_) {
     ssize_t count;
+    //此处清0，以免字符串处理时有影响
+    memset(buf, 0, MAXLINE);
     count = read(readfd, buf, sizeof(buf));
     if (-1 == count) {
       if (errno != EAGAIN) {
         // EAGAIN means all data been read, go back.
         printf("read failed %d.", errno);
+        HandleSockErr(readfd);
       }
       break;
     } else if (count == 0) {
-      /*TODO: graceful socket close*/
+      HandleSockErr(readfd);
       break;
     } else {
-      write(pair, buf, count);
+      printf("fd %d recv %s.\n", readfd, buf);
+      ParseFtdData(readfd, type, buf, &count);
+      if (-1 != pair)
+        write(pair, buf, count);
     }
+  }
+}
+
+static void HandleEpollIn(int readfd) {
+  SockType type = GetSockType(readfd);
+  if (type == SOCKDEFAULT) {
+    printf("sock %d type not found.\n", readfd);
+    return;
+  }
+  if (DATALISTEN == readfd) {
+
+  } else {
+    RecvTcpData(readfd, type);
   }
 }
 
@@ -185,7 +218,7 @@ static void* RetransThread(void* param) {
       continue;
     }
     for (int index = 0; index < readynum; ++index) {
-      printf("lrh fd %d recv msg.\n", epollevent_[index].data.fd);
+      printf("fd %d recv msg.\n", epollevent_[index].data.fd);
       if (epollevent_[index].events & EPOLLOUT) {
         // after connect, bind the connection
         if (0 == CheckSockConnect(epollevent_[index].data.fd)) {
@@ -204,7 +237,7 @@ static void* RetransThread(void* param) {
           printf("listen index %d, fd %d.\n", index, listenfd_);
           AcceptHandle();
         } else {
-          RecvTcpData(epollevent_[index].data.fd);
+          HandleEpollIn(epollevent_[index].data.fd);
         }
       }
     }
@@ -227,7 +260,7 @@ int StartRetrans(uint16_t port, size_t pollsize) {
     printf("create retransthread failed!\n");
     return -1;
   }
-  MapInit(port);
+  MapInit();
   return 0;
 }
 

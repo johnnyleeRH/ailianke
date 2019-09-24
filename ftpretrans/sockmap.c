@@ -27,8 +27,6 @@ static SlbSvrMap* head_;
 static pthread_mutex_t mtx_;
 static SockTypeMap* socktypehead_;
 
-enum DataMod { DEFAULT = -1, PASV = 0, PORT = 1 };
-
 SockType GetSockType(int fd) {
   SockTypeMap* tmp = socktypehead_;
   while (tmp) {
@@ -38,6 +36,43 @@ SockType GetSockType(int fd) {
     tmp = tmp->next_;
   }
   return SOCKDEFAULT;
+}
+
+DataMod GetSockMod(int fd, SockType type) {
+  DataMod mod = DEFAULT;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      mod = tmp->datamod_;
+      break;
+    }
+    if (type == CTRLSVR && tmp->ctrlsvr_ == fd) {
+      mod = tmp->datamod_;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return mod;
+}
+
+int SetSockMod(int fd, SockType type, DataMod mod) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      tmp->datamod_ = mod;
+      break;
+    }
+    if (type == CTRLSVR && tmp->ctrlsvr_ == fd) {
+      tmp->datamod_ = mod;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return 0;
 }
 
 static void SetSockType(int fd, SockType type) {
