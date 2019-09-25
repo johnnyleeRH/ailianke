@@ -58,6 +58,43 @@ DataMod GetSockMod(int fd, SockType type) {
   return mod;
 }
 
+int NoDataPair(int fd) {
+  int ret = -1;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (tmp->listenfd_ == fd) {
+      if (-1 == tmp->datacli_ && -1 == tmp->datasvr_) {
+        ret = 0;
+      } else {
+        ret = -1;
+      }
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return ret;
+}
+
+void SetDataListenSock(int fd, SockType type, int listenfd) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      tmp->listenfd_ = listenfd;
+      break;
+    }
+    if (type == CTRLSVR && tmp->ctrlsvr_ == fd) {
+      tmp->listenfd_ = listenfd;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return;
+}
+
 int SetSockMod(int fd, SockType type, DataMod mod) {
   pthread_mutex_lock(&mtx_);
   SlbSvrMap* tmp = head_;
@@ -147,6 +184,82 @@ void SetSockType(int fd, SockType type) {
   tmp->next_ = newmap;
 }
 
+static void RemoveSockType(int fd) {
+  SockTypeMap* tmp = socktypehead_;
+  SockTypeMap* pre = socktypehead_;
+  if (tmp->fd_ == fd) {
+    socktypehead_ = socktypehead_->next_;
+    free(tmp);
+    return;
+  }
+  while (tmp) {
+    if (tmp->fd_ == fd) {
+      pre->next_ = tmp->next_;
+      free(tmp);
+      break;
+    }
+    pre = tmp;
+    tmp = tmp->next_;
+  }
+}
+
+static void RemoveSlbSvrMap(int fd, SockType type) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  SlbSvrMap* pre = head_;
+  if ((type == CTRLCLI && fd == tmp->ctrlcli_) ||
+      (type == CTRLSVR && fd == tmp->ctrlsvr_)) {
+    head_ = head_->next_;
+    free(tmp);
+    pthread_mutex_unlock(&mtx_);
+    return;
+  }
+  while (tmp) {
+    if ((type == CTRLCLI && fd == tmp->ctrlcli_) ||
+        (type == CTRLSVR && fd == tmp->ctrlsvr_)) {
+      pre->next_ = tmp->next_;
+      free(tmp);
+      break;
+    }
+    pre = tmp;
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+}
+
+static void ResetSlbSvrMap(int fd, SockType type) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (tmp) {
+    if (type == DATACLI && fd == tmp->datacli_) {
+      tmp->datacli_ = -1;
+      break;
+    }
+
+    if (type == DATASVR && fd == tmp->datasvr_) {
+      tmp->datasvr_ = -1;
+      break;
+    }
+    if (type == DATALISTEN && fd == tmp->listenfd_) {
+      tmp->listenfd_ = -1;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+
+  pthread_mutex_unlock(&mtx_);
+}
+
+void RemoveSock(int fd) {
+  SockType type = GetSockType(fd);
+  RemoveSockType(fd);
+  if (type == CTRLCLI || type == CTRLSVR) {
+    RemoveSlbSvrMap(fd, type);
+  } else {
+    ResetSlbSvrMap(fd, type);
+  }
+}
+
 int MapInit() {
   head_ = 0;
   socktypehead_ = 0;
@@ -161,8 +274,7 @@ int MapRelease() {
 
 int FindPeerAddr(int fd, struct sockaddr_in* addr) {
   SockType type = GetSockType(fd);
-  if (CTRLCLI != type && DATACLI != type && DATASVR != type)
-    return -1;
+  if (CTRLCLI != type && DATACLI != type && DATASVR != type) return -1;
   int ret = -1;
   pthread_mutex_lock(&mtx_);
   SlbSvrMap* tmp = head_;
@@ -173,19 +285,44 @@ int FindPeerAddr(int fd, struct sockaddr_in* addr) {
       break;
     }
     if (type == DATACLI && tmp->datacli_ == fd) {
-      if (tmp->datamod_ != PASV)
-        break;
+      if (tmp->datamod_ != PASV) break;
       memcpy((char*)addr, (char*)&(tmp->realsvr_), sizeof(struct sockaddr_in));
       addr->sin_port = htons(tmp->port_);
       ret = 0;
       break;
     }
     if (type == DATASVR && tmp->datasvr_ == fd) {
-      if (tmp->datamod_ != PORT)
-        break;
+      if (tmp->datamod_ != PORT) break;
       memcpy((char*)addr, (char*)&(tmp->realcli_), sizeof(struct sockaddr_in));
       addr->sin_port = htons(tmp->port_);
       ret = 0;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return ret;
+}
+
+int FineDataConnAddr(int listenfd, struct sockaddr_in* addr) {
+  int ret = -1;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (tmp->listenfd_ == listenfd) {
+      // pasv connect to real svr
+      if (PASV == tmp->datamod_) {
+        memcpy((char*)addr, (char*)&(tmp->realsvr_),
+               sizeof(struct sockaddr_in));
+        addr->sin_port = htons(tmp->port_);
+        ret = 0;
+      } else if (PORT == tmp->datamod_) {
+        // port connect to real client
+        memcpy((char*)addr, (char*)&(tmp->realcli_),
+               sizeof(struct sockaddr_in));
+        addr->sin_port = htons(tmp->port_);
+        ret = 0;
+      }
       break;
     }
     tmp = tmp->next_;
@@ -219,11 +356,30 @@ static int AppendSockMap(SlbSvrMap* map) {
   return 0;
 }
 
+int FindListenSock(int fd, SockType type) {
+  int listen = -1;
+  if (DATACLI != type && DATASVR != type) return listen;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == DATACLI && tmp->datacli_ == fd) {
+      listen = tmp->listenfd_;
+      break;
+    }
+    if (type == DATASVR && tmp->datasvr_ == fd) {
+      listen = tmp->listenfd_;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return listen;
+}
+
 int FindPairSock(int fd) {
   int pair = -1;
   SockType type = GetSockType(fd);
-  if (SOCKDEFAULT == type || DATALISTEN == type)
-    return pair;
+  if (SOCKDEFAULT == type || DATALISTEN == type) return pair;
   pthread_mutex_lock(&mtx_);
   SlbSvrMap* tmp = head_;
   while (0 != tmp) {
@@ -281,4 +437,29 @@ int ConnBegin(const int slbfd, const int clifd, const char* svraddr) {
     return 0;
   }
   return -1;
+}
+
+void MakeDataPair(int listenfd, int acceptfd, int connfd) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (listenfd == tmp->listenfd_) {
+      //与 real svr 直接交互的为datacli，与real client直接交互的为datasvr
+      if (PASV == tmp->datamod_) {
+        tmp->datacli_ = connfd;
+        tmp->datasvr_ = acceptfd;
+        SetSockType(tmp->datacli_, DATACLI);
+        SetSockType(tmp->datasvr_, DATASVR);
+      } else if (PORT == tmp->datamod_) {
+        tmp->datasvr_ = connfd;
+        tmp->datacli_ = acceptfd;
+        SetSockType(tmp->datacli_, DATACLI);
+        SetSockType(tmp->datasvr_, DATASVR);
+      }
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return;
 }

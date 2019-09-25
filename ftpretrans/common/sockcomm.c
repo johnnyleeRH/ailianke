@@ -24,6 +24,7 @@ int SetNonBlock(int sockfd) {
 
 int CreateAndBind(uint16_t port, int* listenfd) {
   *listenfd = socket(AF_INET, SOCK_STREAM, 0);
+  printf("create new listen sock %d.\n", *listenfd);
   if (-1 == *listenfd) {
     printf("create server socket failed error %d.", errno);
     return -1;

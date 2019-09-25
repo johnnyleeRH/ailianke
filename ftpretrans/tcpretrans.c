@@ -31,8 +31,7 @@ static void ReConnect(int fd) {
     printf("client peer not found.\n");
     return;
   }
-  if (connect(fd, (struct sockaddr*)&servaddr,
-              sizeof(servaddr)) < 0) {
+  if (connect(fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
     printf("connect failed, errno %d\n", errno);
   }
 }
@@ -60,7 +59,34 @@ static int CheckSockConnect(int fd) {
   return 0;
 }
 
-// TODO：需要提供真实的svr IP
+int ConnectDataPeer(int listenfd, int infd) {
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in servaddr;
+
+  if (sockfd == -1) {
+    printf("client socket creation failed\n");
+    return -1;
+  }
+
+  if (0 != SetNonBlock(sockfd)) return -1;
+  AddConnEvent(sockfd);
+  if (0 != FineDataConnAddr(listenfd, &servaddr)) {
+    printf("not found data client addr.\n");
+    return -1;
+  }
+  MakeDataPair(listenfd, infd, sockfd);
+  if (connect(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) <
+      0) {
+    if (errno != EINPROGRESS) {
+      printf("connection with the server 0x%x failed\n",
+             servaddr.sin_addr.s_addr);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+// TODO：需要提供真实的svr IP，command消息发送
 int ConnectRealSvr(const int slbfd, const char* svraddr) {
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in servaddr;
@@ -88,14 +114,38 @@ int ConnectRealSvr(const int slbfd, const char* svraddr) {
   return 0;
 }
 
+static void CloseSock(const int fd) {
+  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
+    printf("epoll control delete socket [%d] error %d.\n", fd, errno);
+  else
+    printf("delete socket [%d] event success.\n", fd);
+  close(fd);
+  RemoveSock(fd);
+}
+
 // 需要关闭对应的pair套接字
 static void HandleSockErr(const int fd) {
-  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
-    printf("epoll control delete socket [%d] error %d.", fd, errno);
-  else
-    printf("delete socket [%d] event success.", fd);
-  close(fd);
-  // ReleaseByCli(fd);
+  SockType type = GetSockType(fd);
+  if (DATALISTEN == type) {
+    CloseSock(fd);
+  } else if (DATACLI == type || DATASVR == type) {
+    int pair = FindPairSock(fd);
+    int listen = FindListenSock(fd, type);
+    CloseSock(fd);
+    if (pair > 0) {
+      CloseSock(pair);
+    }
+    if (listen > 0) {
+      CloseSock(listen);
+    }
+    // remove listen
+  } else if (CTRLCLI == type || CTRLSVR == type) {
+    int pair = FindPairSock(fd);
+    CloseSock(fd);
+    if (pair > 0) {
+      CloseSock(pair);
+    }
+  }
 }
 
 // 等待与真实服务端建立连接后，再侦听客户端的数据
@@ -125,6 +175,30 @@ static int SessionConnected(int fd) {
     return 0;
   }
   return -1;
+}
+
+static void HandleDataListen(int listenfd) {
+  struct sockaddr in_addr;
+  socklen_t in_len = sizeof(in_addr);
+
+  while (running_) {
+    int infd = accept(listenfd, &in_addr, &in_len);
+    if (-1 == infd) {
+      if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+        return;
+      else {
+        printf("data accept failed.");
+        return;
+      }
+    }
+    if (0 != NoDataPair(listenfd)) {
+      printf("error happen, data sock pair already exsit.\n");
+      return;
+    }
+    if (-1 == SetNonBlock(infd)) return;
+    ConnectDataPeer(listenfd, infd);
+    printf("new data socket %d accepted.\n", infd);
+  }
 }
 
 static void AcceptHandle() {
@@ -184,15 +258,19 @@ static void RecvTcpData(int readfd, SockType type) {
     } else {
       printf("fd %d recv %s.\n", readfd, buf);
       uint16_t port = ParseFtdData(readfd, type, buf, &count);
+      if (-1 != pair) {
+        printf("pair fd %d write %s.\n", pair, buf);
+        write(pair, buf, count);
+      }
       if (port > 0) {
         int fd;
         if (0 == CreateAndBind(port, &fd)) {
           if (0 == SetNonBlock(fd)) {
             AddListenEvent(fd);
             SetSockType(fd, DATALISTEN);
+            SetDataListenSock(readfd, type, fd);
           }
         }
-        if (-1 != pair) write(pair, buf, count);
       }
     }
   }
@@ -242,7 +320,15 @@ static void* RetransThread(void* param) {
           printf("listen index %d, fd %d.\n", index, listenfd_);
           AcceptHandle();
         } else {
-          HandleEpollIn(epollevent_[index].data.fd);
+          SockType type = GetSockType(epollevent_[index].data.fd);
+          if (SOCKDEFAULT == type) {
+            printf("error happen, no sock type found.\n");
+            continue;
+          }
+          if (DATALISTEN == type) {
+            HandleDataListen(epollevent_[index].data.fd);
+          } else
+            HandleEpollIn(epollevent_[index].data.fd);
         }
       }
     }

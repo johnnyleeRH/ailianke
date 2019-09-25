@@ -31,5 +31,6 @@ int SetSockMod(int fd, SockType type, DataMod mod);
 DataMod GetSockMod(int fd, SockType type);
 int SetDataPort(int fd, SockType type, uint16_t port);
 uint16_t GetDataPort(int fd, SockType type);
+int NoDataPair(int fd);
 
 #endif  // SOCK_MAP_H_

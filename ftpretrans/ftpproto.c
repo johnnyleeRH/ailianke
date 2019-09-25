@@ -88,7 +88,6 @@ static uint16_t ParseCliCommand(const int fd, char* buf, ssize_t* cnt) {
   // have send "PASV"
   if (PASVTRIGGERED == mod) {
     if (0 != strstr(buf, "227")) {
-      // TODO: 接收返回的PORT信息，修改本地IP内容
       // 227 Entering Passive Mode (10,64,38,48,244,113).\r\n ==> 227 Entering
       // Passive Mode (10,10,108,147,244,113).\r\n
       uint16_t listenport = ReplaceAddress(fd, buf, cnt);
@@ -121,7 +120,6 @@ static void ParseSvrCommand(const int fd, char* buf, ssize_t* cnt) {
   // PORT模式需要修改客户端IP为本地IP
   if (0 != strstr(buf, "PORT")) {
     SetSockMod(fd, CTRLSVR, PORTTRIGGERED);
-    // TODO：记录端口号，修改本地IP内容
     // PORT 10,64,38,48,236,66\r\n ==> PORT 10,10,108,147,236,66\r\n
     uint16_t listenport = ReplaceAddress(fd, buf, cnt);
     SetDataPort(fd, CTRLSVR, listenport);
