@@ -83,17 +83,19 @@ static uint16_t ReplaceAddress(const int fd, char* buf, ssize_t* cnt) {
 
 // client command是套接字作为客户端使用的情景
 //此时收到是从真实服务端返回的包
-static void ParseCliCommand(const int fd, char* buf, ssize_t* cnt) {
+static uint16_t ParseCliCommand(const int fd, char* buf, ssize_t* cnt) {
   DataMod mod = GetSockMod(fd, CTRLCLI);
   // have send "PASV"
   if (PASVTRIGGERED == mod) {
     if (0 != strstr(buf, "227")) {
-      SetSockMod(fd, CTRLCLI, PASV);
-      printf("ftp go to pasv mode.\n");
       // TODO: 接收返回的PORT信息，修改本地IP内容
       // 227 Entering Passive Mode (10,64,38,48,244,113).\r\n ==> 227 Entering
       // Passive Mode (10,10,108,147,244,113).\r\n
-      ReplaceAddress(fd, buf, cnt);
+      uint16_t listenport = ReplaceAddress(fd, buf, cnt);
+      SetDataPort(fd, CTRLCLI, listenport);
+      SetSockMod(fd, CTRLCLI, PASV);
+      printf("ftp go to pasv mode.\n");
+      return listenport;
     } else {
       SetSockMod(fd, CTRLCLI, DEFAULT);
     }
@@ -101,10 +103,12 @@ static void ParseCliCommand(const int fd, char* buf, ssize_t* cnt) {
     if (0 != strstr(buf, "200")) {
       SetSockMod(fd, CTRLCLI, PORT);
       printf("ftp go to port mode.\n");
+      return GetDataPort(fd, CTRLCLI);
     } else {
       SetSockMod(fd, CTRLCLI, DEFAULT);
     }
   }
+  return 0;
 }
 
 // svr command是套接字作为服务端使用的情景
@@ -119,16 +123,20 @@ static void ParseSvrCommand(const int fd, char* buf, ssize_t* cnt) {
     SetSockMod(fd, CTRLSVR, PORTTRIGGERED);
     // TODO：记录端口号，修改本地IP内容
     // PORT 10,64,38,48,236,66\r\n ==> PORT 10,10,108,147,236,66\r\n
-    ReplaceAddress(fd, buf, cnt);
+    uint16_t listenport = ReplaceAddress(fd, buf, cnt);
+    SetDataPort(fd, CTRLSVR, listenport);
   }
   return;
 }
 
 //对收到的数据校验或者二次加工
-void ParseFtdData(const int fd, const SockType type, char* buf, ssize_t* cnt) {
-  if (CTRLCLI != type && CTRLSVR != type) return;
+//返回需要侦听的端口号
+uint16_t ParseFtdData(const int fd, const SockType type, char* buf, ssize_t* cnt) {
+  if (CTRLCLI != type && CTRLSVR != type) return 0;
   if (CTRLCLI == type)
-    ParseCliCommand(fd, buf, cnt);
-  else
+    return ParseCliCommand(fd, buf, cnt);
+  else {
     ParseSvrCommand(fd, buf, cnt);
+  }
+  return 0;
 }

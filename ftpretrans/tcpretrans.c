@@ -26,9 +26,8 @@ static int AddConnEvent(int fd) {
 }
 
 static void ReConnect(int fd) {
-  #if 0
   struct sockaddr_in servaddr;
-  if (0 != FindPeerInBack(fd, &servaddr)) {
+  if (0 != FindPeerAddr(fd, &servaddr)) {
     printf("client peer not found.\n");
     return;
   }
@@ -36,7 +35,6 @@ static void ReConnect(int fd) {
               sizeof(servaddr)) < 0) {
     printf("connect failed, errno %d\n", errno);
   }
-  #endif
 }
 
 static int CheckSockConnect(int fd) {
@@ -105,7 +103,7 @@ static int SessionConnected(int fd) {
   if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_DEL, fd, 0))
     printf("epoll control delete socket [%d] error %d.", fd, errno);
   else {
-    //remove EPOLLOUT
+    // remove EPOLLOUT
     struct epoll_event event;
     event.data.fd = fd;
     event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
@@ -149,6 +147,22 @@ static void AcceptHandle() {
   }
 }
 
+static int AddListenEvent(int fd) {
+  struct epoll_event event;
+  event.data.fd = fd;
+  event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &event)) {
+    printf("epoll control listen error %d.", errno);
+    return -1;
+  }
+
+  if (-1 == listen(fd, SOMAXCONN)) {
+    printf("server socket listen error %d.", errno);
+    return -1;
+  }
+  return 0;
+}
+
 static void RecvTcpData(int readfd, SockType type) {
   static char buf[MAXLINE];
   int pair = FindPairSock(readfd);
@@ -169,9 +183,17 @@ static void RecvTcpData(int readfd, SockType type) {
       break;
     } else {
       printf("fd %d recv %s.\n", readfd, buf);
-      ParseFtdData(readfd, type, buf, &count);
-      if (-1 != pair)
-        write(pair, buf, count);
+      uint16_t port = ParseFtdData(readfd, type, buf, &count);
+      if (port > 0) {
+        int fd;
+        if (0 == CreateAndBind(port, &fd)) {
+          if (0 == SetNonBlock(fd)) {
+            AddListenEvent(fd);
+            SetSockType(fd, DATALISTEN);
+          }
+        }
+        if (-1 != pair) write(pair, buf, count);
+      }
     }
   }
 }
@@ -183,26 +205,9 @@ static void HandleEpollIn(int readfd) {
     return;
   }
   if (DATALISTEN == readfd) {
-
   } else {
     RecvTcpData(readfd, type);
   }
-}
-
-static int AddListenEvent(int fd) {
-  struct epoll_event event;
-  event.data.fd = fd;
-  event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-  if (-1 == epoll_ctl(epollfd_, EPOLL_CTL_ADD, fd, &event)) {
-    printf("epoll control listen error %d.", errno);
-    return -1;
-  }
-
-  if (-1 == listen(fd, SOMAXCONN)) {
-    printf("server socket listen error %d.", errno);
-    return -1;
-  }
-  return 0;
 }
 
 static void* RetransThread(void* param) {

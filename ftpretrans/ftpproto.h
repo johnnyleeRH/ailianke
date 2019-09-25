@@ -4,6 +4,6 @@
 #include <sys/types.h>
 #include "sockmap.h"
 
-void ParseFtdData(const int fd, const SockType type, char* buf, ssize_t* cnt);
+uint16_t ParseFtdData(const int fd, const SockType type, char* buf, ssize_t* cnt);
 
 #endif // FTP_PROTO_H_

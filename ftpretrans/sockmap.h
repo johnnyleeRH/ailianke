@@ -19,15 +19,17 @@ typedef enum _DataMod_ {
   PASV = 2,
   PORT = 3
 } DataMod;
-// int Connected(const int clifd);
+
 int ConnBegin(const int slbfd, const int clifd, const char* svraddr);
-// int FindPeerInBack(int clifd, struct sockaddr_in* addr);
 // void ReleaseByCli(int clifd);
 int MapInit();
 int MapDestroy();
 int FindPairSock(int fd);
+void SetSockType(int fd, SockType type);
 SockType GetSockType(int fd);
 int SetSockMod(int fd, SockType type, DataMod mod);
 DataMod GetSockMod(int fd, SockType type);
+int SetDataPort(int fd, SockType type, uint16_t port);
+uint16_t GetDataPort(int fd, SockType type);
 
 #endif  // SOCK_MAP_H_

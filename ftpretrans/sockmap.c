@@ -12,6 +12,7 @@ typedef struct _SlbSvrMap_ {
   int datacli_;
   int listenfd_;
   int datamod_;
+  uint16_t port_;
   struct sockaddr_in realcli_;
   struct sockaddr_in realsvr_;
   struct _SlbSvrMap_* next_;
@@ -75,7 +76,44 @@ int SetSockMod(int fd, SockType type, DataMod mod) {
   return 0;
 }
 
-static void SetSockType(int fd, SockType type) {
+int SetDataPort(int fd, SockType type, uint16_t port) {
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      tmp->port_ = port;
+      break;
+    }
+    if (type == CTRLSVR && tmp->ctrlsvr_ == fd) {
+      tmp->port_ = port;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return 0;
+}
+
+uint16_t GetDataPort(int fd, SockType type) {
+  uint16_t port = 0;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      port = tmp->port_;
+      break;
+    }
+    if (type == CTRLSVR && tmp->ctrlsvr_ == fd) {
+      port = tmp->port_;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return port;
+}
+
+void SetSockType(int fd, SockType type) {
   if (0 == socktypehead_) {
     socktypehead_ = (SockTypeMap*)malloc(sizeof(SockTypeMap));
     if (0 == socktypehead_) {
@@ -119,6 +157,41 @@ int MapInit() {
 int MapRelease() {
   pthread_mutex_destroy(&mtx_);
   return 0;
+}
+
+int FindPeerAddr(int fd, struct sockaddr_in* addr) {
+  SockType type = GetSockType(fd);
+  if (CTRLCLI != type && DATACLI != type && DATASVR != type)
+    return -1;
+  int ret = -1;
+  pthread_mutex_lock(&mtx_);
+  SlbSvrMap* tmp = head_;
+  while (0 != tmp) {
+    if (type == CTRLCLI && tmp->ctrlcli_ == fd) {
+      memcpy((char*)addr, (char*)&(tmp->realsvr_), sizeof(struct sockaddr_in));
+      ret = 0;
+      break;
+    }
+    if (type == DATACLI && tmp->datacli_ == fd) {
+      if (tmp->datamod_ != PASV)
+        break;
+      memcpy((char*)addr, (char*)&(tmp->realsvr_), sizeof(struct sockaddr_in));
+      addr->sin_port = htons(tmp->port_);
+      ret = 0;
+      break;
+    }
+    if (type == DATASVR && tmp->datasvr_ == fd) {
+      if (tmp->datamod_ != PORT)
+        break;
+      memcpy((char*)addr, (char*)&(tmp->realcli_), sizeof(struct sockaddr_in));
+      addr->sin_port = htons(tmp->port_);
+      ret = 0;
+      break;
+    }
+    tmp = tmp->next_;
+  }
+  pthread_mutex_unlock(&mtx_);
+  return ret;
 }
 
 static int AppendSockMap(SlbSvrMap* map) {
@@ -166,7 +239,7 @@ int FindPairSock(int fd) {
       pair = tmp->datasvr_;
       break;
     }
-    if (type == CTRLSVR && tmp->datasvr_ == fd) {
+    if (type == DATASVR && tmp->datasvr_ == fd) {
       pair = tmp->datacli_;
       break;
     }
