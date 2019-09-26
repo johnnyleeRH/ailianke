@@ -187,6 +187,8 @@ void SetSockType(int fd, SockType type) {
 static void RemoveSockType(int fd) {
   SockTypeMap* tmp = socktypehead_;
   SockTypeMap* pre = socktypehead_;
+  if (socktypehead_ == 0)
+    return;
   if (tmp->fd_ == fd) {
     socktypehead_ = socktypehead_->next_;
     free(tmp);
@@ -207,6 +209,10 @@ static void RemoveSlbSvrMap(int fd, SockType type) {
   pthread_mutex_lock(&mtx_);
   SlbSvrMap* tmp = head_;
   SlbSvrMap* pre = head_;
+  if (head_ == 0) {
+    pthread_mutex_unlock(&mtx_);
+    return;
+  }
   if ((type == CTRLCLI && fd == tmp->ctrlcli_) ||
       (type == CTRLSVR && fd == tmp->ctrlsvr_)) {
     head_ = head_->next_;

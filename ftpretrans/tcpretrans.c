@@ -216,7 +216,7 @@ static void AcceptHandle() {
       }
     }
     if (-1 == SetNonBlock(infd)) return;
-    ConnectRealSvr(infd, "10.64.35.117");
+    ConnectRealSvr(infd, "10.64.38.48");
     printf("new socket %d accepted.\n", infd);
   }
 }
