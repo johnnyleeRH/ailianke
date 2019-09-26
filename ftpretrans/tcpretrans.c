@@ -216,7 +216,7 @@ static void AcceptHandle() {
       }
     }
     if (-1 == SetNonBlock(infd)) return;
-    ConnectRealSvr(infd, "10.64.38.48");
+    ConnectRealSvr(infd, "10.64.35.117");
     printf("new socket %d accepted.\n", infd);
   }
 }
@@ -256,10 +256,8 @@ static void RecvTcpData(int readfd, SockType type) {
       HandleSockErr(readfd);
       break;
     } else {
-      printf("fd %d recv %s.\n", readfd, buf);
       uint16_t port = ParseFtdData(readfd, type, buf, &count);
       if (-1 != pair) {
-        printf("pair fd %d write %s.\n", pair, buf);
         write(pair, buf, count);
       }
       if (port > 0) {
@@ -311,7 +309,12 @@ static void* RetransThread(void* param) {
       if ((epollevent_[index].events & EPOLLERR) ||
           (epollevent_[index].events & EPOLLHUP) ||
           (epollevent_[index].events & EPOLLRDHUP)) {
-        printf("epoll error happen, events %u.", epollevent_[index].events);
+        printf("epoll error happen, events %u.\n", epollevent_[index].events);
+        if ((epollevent_[index].events & EPOLLRDHUP) &&
+            (epollevent_[index].events & EPOLLIN)) {
+          RecvTcpData(epollevent_[index].data.fd,
+                      GetSockType(epollevent_[index].data.fd));
+        }
         HandleSockErr(epollevent_[index].data.fd);
         continue;
       }
